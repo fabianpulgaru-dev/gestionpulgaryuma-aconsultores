@@ -54,8 +54,8 @@ button,input,select,textarea{font:inherit} button{cursor:pointer} a{color:inheri
 <body>
 <header class="topbar">
   <div class="topbar-inner">
-    <span class="traffic">● ● ●</span><div class="brand">Pulgar & Umaña <small>Centro de negocio · v3 · compartido</small></div>
-    <div class="top-spacer"></div><span class="conn" id="firebaseStatus">Conectando a Firebase…</span>
+    <span class="traffic">● ● ●</span><div class="brand">Pulgar & Umaña <small>Centro de negocio · v4 · Firebase compartido</small></div>
+    <div class="top-spacer"></div><span class="conn syncing" id="firebaseStatus">Conectando a Firebase…</span>
     <button class="top-btn" id="btnExport">⇩ Exportar</button><button class="top-btn" id="btnImport">⇧ Importar</button><input id="importFile" type="file" accept="application/json" hidden>
   </div>
   <nav class="module-nav">
@@ -172,8 +172,15 @@ const seed={
 // Se reutiliza la infraestructura RTDB ya usada por el panel de gestión,
 // pero en una rama completamente separada para este negocio.
 // ══════════════════════════════════════════════════════════════
-const PU_FB_URL='https://ee12026-f5e3d-default-rtdb.firebaseio.com';
-const PU_FB_PATH=PU_FB_URL+'/pulgar_umana_negocio_v3.json';
+// ══════════════════════════════════════════════════════════════
+// FIREBASE · MISMA CONFIGURACIÓN Y MECANISMO DEL PANEL DE GESTIÓN
+// Base: ee12026-f5e3d-default-rtdb
+// P&U se guarda DENTRO de panel_talleres para heredar la misma configuración,
+// pero en una rama propia que no modifica talleres, casos ni otros datos UTE.
+// ══════════════════════════════════════════════════════════════
+const FB_URL = 'https://ee12026-f5e3d-default-rtdb.firebaseio.com';
+const FB_PATH = FB_URL + '/panel_talleres/pulgar_umana_negocio.json';
+
 const DEVICE_ID_KEY='pu_negocio_device_id';
 const DEVICE_ID=localStorage.getItem(DEVICE_ID_KEY)||('dev_'+Math.random().toString(36).slice(2)+Date.now().toString(36));
 localStorage.setItem(DEVICE_ID_KEY,DEVICE_ID);
@@ -186,10 +193,9 @@ let firebaseReady=false;
 let firebaseSaving=false;
 let firebaseDirty=false;
 let firebaseApplyingRemote=false;
-let firebaseStream=null;
 let firebasePollTimer=null;
 let firebaseSaveTimer=null;
-let lastRemoteSignature='';
+let lastRemoteUpdatedAt=0;
 
 function setFirebaseStatus(text,state='syncing'){
   const el=document.getElementById('firebaseStatus');
@@ -199,51 +205,72 @@ function setFirebaseStatus(text,state='syncing'){
   el.classList.add(state);
 }
 
+function validCloudData(data){
+  return !!(
+    data &&
+    typeof data==='object' &&
+    Array.isArray(data.services) &&
+    Array.isArray(data.clients) &&
+    Array.isArray(data.opportunities) &&
+    Array.isArray(data.followups)
+  );
+}
+
 function cloudPayload(){
   const data=structuredClone(db);
   data._sync={
     updatedAt:Date.now(),
     deviceId:DEVICE_ID,
-    version:3
+    version:4
   };
   return data;
-}
-
-function validCloudData(data){
-  return !!(data && typeof data==='object' && Array.isArray(data.services) && Array.isArray(data.clients));
 }
 
 function applyRemoteData(data){
   if(!validCloudData(data))return false;
   const remote=structuredClone(data);
+  const meta=remote._sync||{};
   delete remote._sync;
+
   firebaseApplyingRemote=true;
   db=remote;
   localStorage.setItem(KEY,JSON.stringify(db));
   firebaseApplyingRemote=false;
+
+  lastRemoteUpdatedAt=Number(meta.updatedAt)||Date.now();
   render();
   return true;
 }
 
-async function cloudWriteNow(){
-  if(firebaseApplyingRemote)return;
+// Equivalente al saveData() del panel UTE: PUT REST directo a Firebase.
+async function saveData(toast=false){
+  if(firebaseApplyingRemote)return false;
+
   firebaseSaving=true;
-  setFirebaseStatus('Sincronizando…','syncing');
+  setFirebaseStatus('Sincronizando con Firebase…','syncing');
+
   try{
     const payload=cloudPayload();
-    const r=await fetch(PU_FB_PATH,{
+    const r=await fetch(FB_PATH,{
       method:'PUT',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    lastRemoteSignature=JSON.stringify(payload);
+
+    const j=await r.json().catch(()=>null);
+    if(!r.ok || (j && j.error)){
+      throw new Error((j && j.error) ? j.error : `HTTP ${r.status}`);
+    }
+
     firebaseReady=true;
     firebaseDirty=false;
-    setFirebaseStatus('Firebase sincronizado','connected');
-  }catch(err){
-    console.error('Firebase write:',err);
-    setFirebaseStatus('Sin conexión · copia local','offline');
+    lastRemoteUpdatedAt=payload._sync.updatedAt;
+    setFirebaseStatus('Sincronizado con Firebase','connected');
+    return true;
+  }catch(e){
+    console.warn('FB save error',e);
+    setFirebaseStatus('Sin conexión · cambios solo locales','offline');
+    return false;
   }finally{
     firebaseSaving=false;
   }
@@ -252,7 +279,7 @@ async function cloudWriteNow(){
 function scheduleCloudWrite(){
   if(firebaseApplyingRemote)return;
   clearTimeout(firebaseSaveTimer);
-  firebaseSaveTimer=setTimeout(cloudWriteNow,180);
+  firebaseSaveTimer=setTimeout(()=>saveData(false),180);
 }
 
 function save(){
@@ -261,91 +288,81 @@ function save(){
   scheduleCloudWrite();
 }
 
-async function pullFirebase({seedIfEmpty=false}={}){
+// Equivalente a loadData() del panel UTE: GET REST directo a Firebase.
+async function loadData({firstLoad=false}={}){
   try{
-    const r=await fetch(PU_FB_PATH,{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const remote=await r.json();
+    const r=await fetch(FB_PATH);
+    const j=await r.json();
 
-    if(validCloudData(remote)){
-      const sig=JSON.stringify(remote);
-      if(sig!==lastRemoteSignature && !firebaseSaving && !firebaseDirty){
-        lastRemoteSignature=sig;
-        applyRemoteData(remote);
+    if(!r.ok || (j && j.error)){
+      throw new Error((j && j.error) ? j.error : `HTTP ${r.status}`);
+    }
+
+    if(j===null || j===undefined){
+      // Primera creación de la rama P&U.
+      // Sube la copia que ya existe en este navegador (v2/v3) o, si es un equipo nuevo, el seed.
+      await saveData(false);
+      return true;
+    }
+
+    if(validCloudData(j)){
+      const remoteTs=Number(j?._sync?.updatedAt)||0;
+
+      // Mientras haya cambios locales pendientes no los pisamos.
+      if(!firebaseDirty && !firebaseSaving){
+        if(firstLoad || !remoteTs || remoteTs>lastRemoteUpdatedAt){
+          applyRemoteData(j);
+        }
       }
+
       firebaseReady=true;
-      setFirebaseStatus('Firebase sincronizado','connected');
+      setFirebaseStatus('Sincronizado con Firebase','connected');
       return true;
     }
 
-    if(seedIfEmpty){
-      // Si esta es la primera apertura de la nueva base compartida,
-      // sube lo que ya existe en el navegador (o los datos iniciales).
-      await cloudWriteNow();
-      return true;
-    }
-  }catch(err){
-    console.error('Firebase read:',err);
-    setFirebaseStatus('Sin conexión · copia local','offline');
+    throw new Error('La rama P&U existe pero no contiene una estructura válida.');
+  }catch(e){
+    console.warn('FB load error',e);
+    setFirebaseStatus('Sin conexión · usando datos locales','offline');
+    return false;
   }
-  return false;
 }
 
-function startFirebaseStream(){
-  try{
-    if(firebaseStream)firebaseStream.close();
-    firebaseStream=new EventSource(PU_FB_PATH);
-
-    firebaseStream.addEventListener('open',()=>{
-      firebaseReady=true;
-      setFirebaseStatus('Firebase en vivo','connected');
-    });
-
-    firebaseStream.addEventListener('put',(ev)=>{
-      try{
-        const msg=JSON.parse(ev.data);
-        if(msg.path!=='/' || !validCloudData(msg.data))return;
-        const sig=JSON.stringify(msg.data);
-        if(sig===lastRemoteSignature)return;
-        lastRemoteSignature=sig;
-        if(!firebaseSaving && !firebaseDirty)applyRemoteData(msg.data);
-        setFirebaseStatus('Firebase en vivo','connected');
-      }catch(e){console.warn('Firebase stream put:',e)}
-    });
-
-    firebaseStream.addEventListener('patch',(ev)=>{
-      // Como esta app guarda el documento completo, un PATCH es infrecuente.
-      // Ante uno, hacemos una lectura completa para mantener consistencia.
-      pullFirebase();
-    });
-
-    firebaseStream.onerror=()=>{
-      setFirebaseStatus('Reconectando Firebase…','syncing');
-      // EventSource intenta reconectar solo; el polling queda como respaldo.
-    };
-  }catch(err){
-    console.warn('No se pudo iniciar streaming Firebase:',err);
-  }
-
+// Sin EventSource: usamos el mismo REST del panel original.
+// Este sondeo solo permite que otro computador vea los cambios sin recargar.
+function startFirebasePolling(){
   clearInterval(firebasePollTimer);
-  firebasePollTimer=setInterval(()=>pullFirebase(),8000);
+  firebasePollTimer=setInterval(()=>{
+    if(!firebaseSaving && !firebaseDirty) loadData({firstLoad:false});
+  },5000);
 }
 
 async function initFirebase(){
   setFirebaseStatus('Conectando a Firebase…','syncing');
-  await pullFirebase({seedIfEmpty:true});
-  startFirebaseStream();
+
+  // Primero intentamos leer exactamente como el panel UTE.
+  await loadData({firstLoad:true});
+  startFirebasePolling();
 
   window.addEventListener('online',async()=>{
     setFirebaseStatus('Reconectando Firebase…','syncing');
-    if(firebaseDirty) await cloudWriteNow();
-    else await pullFirebase();
-    startFirebaseStream();
+    if(firebaseDirty) await saveData(false);
+    await loadData({firstLoad:false});
+    startFirebasePolling();
   });
+
   window.addEventListener('offline',()=>{
     setFirebaseStatus('Sin internet · copia local','offline');
   });
+
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible' && navigator.onLine){
+      if(firebaseDirty) saveData(false);
+      else loadData({firstLoad:false});
+    }
+  });
 }
+
 const serviceName=id=>db.services.find(x=>x.id===id)?.name||'Sin servicio'; const clientName=id=>db.clients.find(x=>x.id===id)?.name||'Sin cliente';
 const statusLabel=s=>({activa:'Activa',diseno:'En diseño',idea:'Idea',pausada:'Pausada',prospecto:'Prospecto',contacto:'Contactado',propuesta:'Propuesta',cliente:'Cliente activo',pausado:'Pausado',radar:'Radar',contactar:'Contactar',conversacion:'Conversación',trabajo:'En trabajo',perdida:'Descartada',pendiente:'Pendiente',hecho:'Realizado',espera:'En espera',exploracion:'Exploración',desarrollo:'Desarrollo',activo:'Activo',cerrado:'Cerrado',publicidad:'Publicidad',afiche:'Afiche',referencia:'Referencia',servicio:'Ficha de servicio'}[s]||s||'—');
 const tagClass=s=>['activa','cliente','activo','hecho'].includes(s)?'active':['diseno','contacto','conversacion','desarrollo'].includes(s)?'design':['idea','radar','pendiente','prospecto'].includes(s)?'idea':['pausada','pausado','espera'].includes(s)?'paused':'';
