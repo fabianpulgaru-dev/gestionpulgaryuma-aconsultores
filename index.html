@@ -20,6 +20,10 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;bac
 button,input,select,textarea{font:inherit} button{cursor:pointer} a{color:inherit}.hidden{display:none!important}
 .topbar{position:sticky;top:0;z-index:90;background:rgba(247,249,255,.78);border-bottom:1px solid rgba(255,255,255,.84);box-shadow:0 7px 24px rgba(38,44,85,.08);backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%)}
 .topbar-inner{height:56px;padding:0 22px;display:flex;align-items:center;gap:14px}.traffic{font-size:10px;letter-spacing:3px;color:#ff6158}.brand{font-weight:900;font-size:.94rem}.brand small{font-weight:700;color:var(--mut);margin-left:8px}.top-spacer{flex:1}.conn{font-size:.72rem;color:#4b536f;font-weight:800}.conn:before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:7px;box-shadow:0 0 0 3px rgba(50,184,117,.12)}
+.conn.syncing:before{background:var(--yellow);box-shadow:0 0 0 3px rgba(246,200,69,.16)}
+.conn.offline:before{background:var(--red);box-shadow:0 0 0 3px rgba(223,74,98,.14)}
+.conn.connected:before{background:var(--green);box-shadow:0 0 0 3px rgba(50,184,117,.12)}
+
 .top-btn{border:1px solid rgba(82,89,124,.11);background:rgba(255,255,255,.7);border-radius:10px;padding:7px 10px;color:#3e4561;font-size:.75rem;font-weight:850}.top-btn:hover{background:#fff}.module-nav{display:flex;gap:3px;padding:4px 22px 8px;overflow-x:auto;scrollbar-width:none}.module-nav::-webkit-scrollbar{display:none}.nav-btn{border:0;background:transparent;color:#5d6582;border-radius:9px;padding:7px 10px;font-size:.74rem;font-weight:800;white-space:nowrap}.nav-btn:hover,.nav-btn.active{background:rgba(255,255,255,.78);color:#292e4b;box-shadow:0 2px 9px rgba(40,47,88,.07)}
 .shell{max-width:1480px;margin:auto;padding:28px 28px 120px}.view{display:none}.view.active{display:block}.hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin:3px 0 20px}.hero h1,.hero h2{font-family:Georgia,"Times New Roman",serif;font-weight:500;letter-spacing:-.035em;margin:0;color:#20243d}.hero h1{font-size:3rem}.hero h2{font-size:2.15rem}.hero p{margin:6px 0 0;color:#59617e;max-width:780px;line-height:1.5}.hero-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .btn{border:1px solid var(--line);background:rgba(255,255,255,.83);color:#38405f;border-radius:11px;padding:9px 12px;font-weight:850;font-size:.79rem;box-shadow:0 3px 12px rgba(45,52,98,.04)}.btn:hover{background:#fff;border-color:rgba(var(--violet-rgb),.28)}.btn.primary{background:var(--violet);color:#fff;border-color:transparent;box-shadow:0 8px 20px rgba(var(--violet-rgb),.22)}.btn.primary:hover{filter:brightness(.98);transform:translateY(-1px)}.btn.danger{color:var(--red);background:#fff0f3;border-color:#ffd2db}.btn.icon{width:34px;height:34px;padding:0;display:grid;place-items:center;border-radius:10px}.btn.coral{background:linear-gradient(135deg,var(--coral),var(--pink));color:#fff;border-color:transparent}.btn.green{background:var(--green);color:#fff;border-color:transparent}
@@ -50,8 +54,8 @@ button,input,select,textarea{font:inherit} button{cursor:pointer} a{color:inheri
 <body>
 <header class="topbar">
   <div class="topbar-inner">
-    <span class="traffic">● ● ●</span><div class="brand">Pulgar & Umaña <small>Centro de negocio · v2</small></div>
-    <div class="top-spacer"></div><span class="conn">Guardado local</span>
+    <span class="traffic">● ● ●</span><div class="brand">Pulgar & Umaña <small>Centro de negocio · v3 · compartido</small></div>
+    <div class="top-spacer"></div><span class="conn" id="firebaseStatus">Conectando a Firebase…</span>
     <button class="top-btn" id="btnExport">⇩ Exportar</button><button class="top-btn" id="btnImport">⇧ Importar</button><input id="importFile" type="file" accept="application/json" hidden>
   </div>
   <nav class="module-nav">
@@ -163,8 +167,185 @@ const seed={
   {id:'a3',ico:'↗',title:'Oportunidad registrada',detail:'Validar necesidad con psicóloga independiente',time:now()-10800000}
  ]
 };
-let db; try{db=JSON.parse(localStorage.getItem(KEY))||structuredClone(seed)}catch(e){db=structuredClone(seed)}
-const save=()=>localStorage.setItem(KEY,JSON.stringify(db));
+// ══════════════════════════════════════════════════════════════
+// FIREBASE · BASE COMPARTIDA P&U
+// Se reutiliza la infraestructura RTDB ya usada por el panel de gestión,
+// pero en una rama completamente separada para este negocio.
+// ══════════════════════════════════════════════════════════════
+const PU_FB_URL='https://ee12026-f5e3d-default-rtdb.firebaseio.com';
+const PU_FB_PATH=PU_FB_URL+'/pulgar_umana_negocio_v3.json';
+const DEVICE_ID_KEY='pu_negocio_device_id';
+const DEVICE_ID=localStorage.getItem(DEVICE_ID_KEY)||('dev_'+Math.random().toString(36).slice(2)+Date.now().toString(36));
+localStorage.setItem(DEVICE_ID_KEY,DEVICE_ID);
+
+let db;
+try{db=JSON.parse(localStorage.getItem(KEY))||structuredClone(seed)}
+catch(e){db=structuredClone(seed)}
+
+let firebaseReady=false;
+let firebaseSaving=false;
+let firebaseDirty=false;
+let firebaseApplyingRemote=false;
+let firebaseStream=null;
+let firebasePollTimer=null;
+let firebaseSaveTimer=null;
+let lastRemoteSignature='';
+
+function setFirebaseStatus(text,state='syncing'){
+  const el=document.getElementById('firebaseStatus');
+  if(!el)return;
+  el.textContent=text;
+  el.classList.remove('syncing','offline','connected');
+  el.classList.add(state);
+}
+
+function cloudPayload(){
+  const data=structuredClone(db);
+  data._sync={
+    updatedAt:Date.now(),
+    deviceId:DEVICE_ID,
+    version:3
+  };
+  return data;
+}
+
+function validCloudData(data){
+  return !!(data && typeof data==='object' && Array.isArray(data.services) && Array.isArray(data.clients));
+}
+
+function applyRemoteData(data){
+  if(!validCloudData(data))return false;
+  const remote=structuredClone(data);
+  delete remote._sync;
+  firebaseApplyingRemote=true;
+  db=remote;
+  localStorage.setItem(KEY,JSON.stringify(db));
+  firebaseApplyingRemote=false;
+  render();
+  return true;
+}
+
+async function cloudWriteNow(){
+  if(firebaseApplyingRemote)return;
+  firebaseSaving=true;
+  setFirebaseStatus('Sincronizando…','syncing');
+  try{
+    const payload=cloudPayload();
+    const r=await fetch(PU_FB_PATH,{
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    lastRemoteSignature=JSON.stringify(payload);
+    firebaseReady=true;
+    firebaseDirty=false;
+    setFirebaseStatus('Firebase sincronizado','connected');
+  }catch(err){
+    console.error('Firebase write:',err);
+    setFirebaseStatus('Sin conexión · copia local','offline');
+  }finally{
+    firebaseSaving=false;
+  }
+}
+
+function scheduleCloudWrite(){
+  if(firebaseApplyingRemote)return;
+  clearTimeout(firebaseSaveTimer);
+  firebaseSaveTimer=setTimeout(cloudWriteNow,180);
+}
+
+function save(){
+  localStorage.setItem(KEY,JSON.stringify(db));
+  firebaseDirty=true;
+  scheduleCloudWrite();
+}
+
+async function pullFirebase({seedIfEmpty=false}={}){
+  try{
+    const r=await fetch(PU_FB_PATH,{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const remote=await r.json();
+
+    if(validCloudData(remote)){
+      const sig=JSON.stringify(remote);
+      if(sig!==lastRemoteSignature && !firebaseSaving && !firebaseDirty){
+        lastRemoteSignature=sig;
+        applyRemoteData(remote);
+      }
+      firebaseReady=true;
+      setFirebaseStatus('Firebase sincronizado','connected');
+      return true;
+    }
+
+    if(seedIfEmpty){
+      // Si esta es la primera apertura de la nueva base compartida,
+      // sube lo que ya existe en el navegador (o los datos iniciales).
+      await cloudWriteNow();
+      return true;
+    }
+  }catch(err){
+    console.error('Firebase read:',err);
+    setFirebaseStatus('Sin conexión · copia local','offline');
+  }
+  return false;
+}
+
+function startFirebaseStream(){
+  try{
+    if(firebaseStream)firebaseStream.close();
+    firebaseStream=new EventSource(PU_FB_PATH);
+
+    firebaseStream.addEventListener('open',()=>{
+      firebaseReady=true;
+      setFirebaseStatus('Firebase en vivo','connected');
+    });
+
+    firebaseStream.addEventListener('put',(ev)=>{
+      try{
+        const msg=JSON.parse(ev.data);
+        if(msg.path!=='/' || !validCloudData(msg.data))return;
+        const sig=JSON.stringify(msg.data);
+        if(sig===lastRemoteSignature)return;
+        lastRemoteSignature=sig;
+        if(!firebaseSaving && !firebaseDirty)applyRemoteData(msg.data);
+        setFirebaseStatus('Firebase en vivo','connected');
+      }catch(e){console.warn('Firebase stream put:',e)}
+    });
+
+    firebaseStream.addEventListener('patch',(ev)=>{
+      // Como esta app guarda el documento completo, un PATCH es infrecuente.
+      // Ante uno, hacemos una lectura completa para mantener consistencia.
+      pullFirebase();
+    });
+
+    firebaseStream.onerror=()=>{
+      setFirebaseStatus('Reconectando Firebase…','syncing');
+      // EventSource intenta reconectar solo; el polling queda como respaldo.
+    };
+  }catch(err){
+    console.warn('No se pudo iniciar streaming Firebase:',err);
+  }
+
+  clearInterval(firebasePollTimer);
+  firebasePollTimer=setInterval(()=>pullFirebase(),8000);
+}
+
+async function initFirebase(){
+  setFirebaseStatus('Conectando a Firebase…','syncing');
+  await pullFirebase({seedIfEmpty:true});
+  startFirebaseStream();
+
+  window.addEventListener('online',async()=>{
+    setFirebaseStatus('Reconectando Firebase…','syncing');
+    if(firebaseDirty) await cloudWriteNow();
+    else await pullFirebase();
+    startFirebaseStream();
+  });
+  window.addEventListener('offline',()=>{
+    setFirebaseStatus('Sin internet · copia local','offline');
+  });
+}
 const serviceName=id=>db.services.find(x=>x.id===id)?.name||'Sin servicio'; const clientName=id=>db.clients.find(x=>x.id===id)?.name||'Sin cliente';
 const statusLabel=s=>({activa:'Activa',diseno:'En diseño',idea:'Idea',pausada:'Pausada',prospecto:'Prospecto',contacto:'Contactado',propuesta:'Propuesta',cliente:'Cliente activo',pausado:'Pausado',radar:'Radar',contactar:'Contactar',conversacion:'Conversación',trabajo:'En trabajo',perdida:'Descartada',pendiente:'Pendiente',hecho:'Realizado',espera:'En espera',exploracion:'Exploración',desarrollo:'Desarrollo',activo:'Activo',cerrado:'Cerrado',publicidad:'Publicidad',afiche:'Afiche',referencia:'Referencia',servicio:'Ficha de servicio'}[s]||s||'—');
 const tagClass=s=>['activa','cliente','activo','hecho'].includes(s)?'active':['diseno','contacto','conversacion','desarrollo'].includes(s)?'design':['idea','radar','pendiente','prospecto'].includes(s)?'idea':['pausada','pausado','espera'].includes(s)?'paused':'';
@@ -220,7 +401,10 @@ $('#btnQuickSave').onclick=()=>{quickSave($('#quickText').value,$('#quickType').
 $('#globalSearch').addEventListener('keydown',e=>{if(e.key==='Enter'){const q=e.target.value.trim().toLowerCase();if(!q)return;const hit=flattenViewer().filter(x=>JSON.stringify(x).toLowerCase().includes(q));go('viewer');$('#viewerSearch').value=q;renderViewer();toast(`${hit.length} coincidencia${hit.length===1?'':'s'}`)}});document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();go('home');$('#globalSearch').focus()}});
 $('#btnExport').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(db,null,2)],{type:'application/json'}));a.download='pulgar_umana_negocio_v2.json';a.click();URL.revokeObjectURL(a.href)};$('#btnImport').onclick=()=>$('#importFile').click();$('#importFile').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const data=JSON.parse(await f.text());if(!data.services||!data.clients)throw 0;db=data;save();render();toast('Datos importados')}catch(err){alert('El archivo no tiene un formato válido.')}e.target.value=''};
 window.go=go;window.openServiceEditor=openServiceEditor;window.openClientEditor=openClientEditor;window.openOpportunityEditor=openOpportunityEditor;window.openFollowEditor=openFollowEditor;window.openRepoEditor=openRepoEditor;
+
+// Render inmediato con la copia local y luego conexión compartida.
 render();
+initFirebase();
 </script>
 </body>
 </html>
